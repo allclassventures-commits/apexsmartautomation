@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Apex Smart Automations favicon">
+  <defs>
+    <linearGradient id="apexGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#61e0c1" />
+      <stop offset="100%" stop-color="#9ef2dd" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="#07111f" />
+  <path d="M18 18h12.5c8.7 0 15.5 5.7 15.5 14s-6.8 14-15.5 14H26v8H18V18Zm12 20c4.8 0 7.8-2.5 7.8-6s-3-6-7.8-6H26v12h4Z" fill="url(#apexGradient)" />
+</svg>
