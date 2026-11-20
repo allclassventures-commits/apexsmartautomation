@@ -1,154 +1,109 @@
 #!/usr/bin/env python3
-"""Generate the Apex Smart Automations keychain.
+"""Generate the Apex Smart Automation keychain from the company logo.
 
+Input:  apex-logo.png  (the logo used on the website)
 Outputs (written next to this script):
   apex-keychain.stl         single-piece model (print in one colour)
-  apex-keychain-base.stl    navy base only        } for two-colour / MMU
-  apex-keychain-inlay.stl   raised gold artwork   } printing
-  apex-keychain.svg         full-colour artwork (acrylic / UV print / preview)
+  apex-keychain-base.stl    black base only        } for two-colour / MMU
+  apex-keychain-inlay.stl   raised blue logo trace } printing
+  apex-keychain.svg         full-colour artwork with the real logo (UV print / acrylic)
   apex-keychain-laser.svg   cut (red) + engrave (black) file for laser cutters
 
-Requires: pip install manifold3d shapely fonttools
+Requires: pip install manifold3d shapely opencv-python-headless
 All dimensions are millimetres.
 """
+import base64
 import math
 import pathlib
 import struct
 
-from fontTools.pens.basePen import BasePen
-from fontTools.ttLib import TTFont
+import cv2
+import numpy as np
 from manifold3d import CrossSection, FillRule
-from shapely import affinity
-from shapely.geometry import LineString, Point, Polygon, box
+from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
 OUT = pathlib.Path(__file__).resolve().parent
+LOGO = OUT / "apex-logo.png"
 
 # ---------------------------------------------------------------- parameters
-TAG_W, TAG_H, TAG_R = 74.0, 28.0, 9.0  # tag outline + corner radius
-HOLE_X, HOLE_R = 9.0, 3.4              # key-ring hole (fits 25-30 mm split rings)
-BASE_T = 3.0                           # base plate thickness
-RAISE_T = 1.0                          # height of raised artwork / rim
-RIM_W = 1.2                            # width of raised border
-FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+DISC_R = 26.0          # fob radius (52 mm across)
+TAB_R = 7.0            # radius of the key-ring tab
+TAB_Y = DISC_R + 4.0   # tab centre above the disc centre
+HOLE_R = 3.4           # key-ring hole (fits 25-30 mm split rings)
+BASE_T = 3.0           # base plate thickness
+RAISE_T = 1.0          # height of the raised logo and rim
+RIM_W = 1.2            # width of the raised border
+LOGO_FILL = 24.0       # logo artwork radius on the fob
+MIN_LINE = 0.6         # thin logo lines are thickened to this in the STL (FDM-printable)
 
-NAVY, GOLD_A, GOLD_B = "#09121b", "#b89d62", "#e5cf95"  # from site styles.css
+# logo trace settings (pixels of the 500x500 source image)
+LOGO_C, LOGO_ART_R = 250.0, 238.0  # centre of the round logo, radius of its artwork
+LOGO_BADGE_R = 229.0               # just inside the badge edge (the PNG has a white background)
+THRESHOLD = 90                     # blue-channel brightness that counts as "logo"
+MIN_AREA_PX = 12                   # drop specks smaller than this
+
+BLACK, BLUE = "#000000", "#3aa8ff"
 
 
 # ------------------------------------------------------------------ geometry
-def rounded_rect(w, h, r):
-    return box(r, r, w - r, h - r).buffer(r, resolution=32)
+def trace_logo():
+    """Vector trace of the bright (blue/white) parts of the logo, in mm, centred at 0,0."""
+    img = cv2.imread(str(LOGO), cv2.IMREAD_UNCHANGED)
+    blue, alpha = img[:, :, 0], img[:, :, 3]
+    mask = ((blue > THRESHOLD) & (alpha > 0)).astype(np.uint8) * 255
+    yy, xx = np.mgrid[: mask.shape[0], : mask.shape[1]]
+    mask[(xx - LOGO_C) ** 2 + (yy - LOGO_C) ** 2 > (LOGO_ART_R - 2) ** 2] = 0
+
+    contours, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    k = LOGO_FILL / LOGO_ART_R
+
+    def to_mm(c):
+        return [((x - LOGO_C) * k, (LOGO_C - y) * k) for x, y in c.reshape(-1, 2)]
+
+    shapes = []
+    for i, c in enumerate(contours):
+        if hier[0][i][3] != -1 or cv2.contourArea(c) < MIN_AREA_PX or len(c) < 3:
+            continue
+        holes, j = [], hier[0][i][2]
+        while j != -1:
+            if cv2.contourArea(contours[j]) >= MIN_AREA_PX and len(contours[j]) >= 3:
+                holes.append(to_mm(contours[j]))
+            j = hier[0][j][0]
+        shapes.append(Polygon(to_mm(c), holes).buffer(0).simplify(0.03))
+    # drop the faint glow arcs around the edge of the round logo badge
+    centre = Point(0, 0)
+    shapes = [s for s in shapes if s.distance(centre) < 0.88 * LOGO_FILL]
+    return unary_union(shapes)
 
 
-def apex_mark(size):
-    """Peak chevron with a 'sensor node' dot — the Apex 'A'."""
-    s = size / 16.0
-    stroke = 1.2 * s  # half-width of the chevron legs
-    chev = LineString([(0.6 * s, -2 * s), (8 * s, 14.8 * s), (15.4 * s, -2 * s)]).buffer(
-        stroke, join_style="mitre", mitre_limit=4, cap_style="flat"
-    )
-    cx, cy = 8 * s, 3.4 * s
-    node = Point(cx, cy).buffer(1.25 * s, resolution=24)
-    arcs = []
-    for r_in, r_out in ((2.3, 2.95), (3.8, 4.45)):
-        ring = Point(cx, cy).buffer(r_out * s, resolution=48).difference(
-            Point(cx, cy).buffer(r_in * s, resolution=48))
-        arcs.append(ring.intersection(box(0, cy + 0.5 * s, 16 * s, 16 * s)))
-    # keep a clear gap between the signal arcs and the legs
-    arc = unary_union(arcs).difference(chev.buffer(0.7 * s))
-    mark = unary_union([chev, node, arc]).intersection(box(-5, 0, 50, 50))
-    return mark
-
-
-class FlatPen(BasePen):
-    def __init__(self, glyphset, steps=8):
-        super().__init__(glyphset)
-        self.contours, self.cur, self.steps = [], [], steps
-
-    def _moveTo(self, p):
-        self.cur = [p]
-
-    def _lineTo(self, p):
-        self.cur.append(p)
-
-    def _curveToOne(self, p1, p2, p3):
-        p0 = self.cur[-1]
-        for i in range(1, self.steps + 1):
-            t = i / self.steps
-            mt = 1 - t
-            self.cur.append(tuple(mt**3 * a + 3 * mt * mt * t * b + 3 * mt * t * t * c + t**3 * d
-                                  for a, b, c, d in zip(p0, p1, p2, p3)))
-
-    def _qCurveToOne(self, p1, p2):
-        p0 = self.cur[-1]
-        for i in range(1, self.steps + 1):
-            t = i / self.steps
-            mt = 1 - t
-            self.cur.append(tuple(mt * mt * a + 2 * mt * t * b + t * t * c
-                                  for a, b, c in zip(p0, p1, p2)))
-
-    def _closePath(self):
-        if len(self.cur) > 2:
-            self.contours.append(self.cur)
-        self.cur = []
-
-    _endPath = _closePath
-
-
-def text_shape(txt, cap_height, tracking=0.0):
-    """Text outline as shapely geometry, baseline at y=0, starting at x=0."""
-    font = TTFont(FONT)
-    gs, cmap = font.getGlyphSet(), font.getBestCmap()
-    cap = getattr(font["OS/2"], "sCapHeight", 0) or font["glyf"]["H"].yMax
-    scale = cap_height / cap
-    parts, x = [], 0.0
-    for ch in txt:
-        g = cmap[ord(ch)]
-        pen = FlatPen(gs)
-        gs[g].draw(pen)
-        glyph = None
-        for c in pen.contours:
-            poly = Polygon(c).buffer(0)
-            glyph = poly if glyph is None else glyph.symmetric_difference(poly)
-        if glyph is not None:
-            parts.append(affinity.translate(glyph, xoff=x))
-        x += gs[g].width + tracking / scale
-    return affinity.scale(unary_union(parts), scale, scale, origin=(0, 0))
-
-
-def fit(geom, x0, y0, max_w=None):
-    minx, miny, maxx, _ = geom.bounds
-    if max_w and maxx - minx > max_w:
-        k = max_w / (maxx - minx)
-        geom = affinity.scale(geom, k, k, origin=(minx, miny))
-        minx, miny, maxx, _ = geom.bounds
-    return affinity.translate(geom, x0 - minx, y0 - miny)
+def printable(logo):
+    """Thicken hairline parts (circuit traces) so a 0.4 mm nozzle can print them."""
+    parts = []
+    for p in getattr(logo, "geoms", [logo]):
+        thin = p.buffer(-MIN_LINE / 2).is_empty
+        parts.append(p.buffer(MIN_LINE / 4) if thin else p)
+    return unary_union(parts)
 
 
 def build():
-    outline = rounded_rect(TAG_W, TAG_H, TAG_R)
-    hole = Point(HOLE_X, TAG_H / 2).buffer(HOLE_R, resolution=48)
+    disc = Point(0, 0).buffer(DISC_R, resolution=96)
+    tab = Point(0, TAB_Y).buffer(TAB_R, resolution=48)
+    outline = unary_union([disc, tab]).convex_hull
+    hole = Point(0, TAB_Y).buffer(HOLE_R, resolution=48)
     base = outline.difference(hole)
 
     rim = outline.difference(outline.buffer(-RIM_W, resolution=32))
-    hole_rim = Point(HOLE_X, TAG_H / 2).buffer(HOLE_R + RIM_W, resolution=48).difference(hole)
-
-    mark = fit(apex_mark(16.0), 18.5, 6.0)
-    word_x = mark.bounds[2] + 3.6
-    word = fit(text_shape("APEX", 8.6, tracking=0.9), word_x, 12.4, max_w=TAG_W - word_x - 6.5)
-    sub = fit(text_shape("SMART AUTOMATIONS", 2.6, tracking=0.25), word_x, 7.0,
-              max_w=word.bounds[2] - word_x)
-    divider = box(mark.bounds[2] + 1.6, 6.0, mark.bounds[2] + 2.1, TAG_H - 6.0)
-
-    art = unary_union([rim, hole_rim, mark, word, sub, divider]).intersection(base)
-    return base, art, dict(mark=mark, word=word, sub=sub, divider=divider, hole=hole, outline=outline)
+    hole_rim = Point(0, TAB_Y).buffer(HOLE_R + RIM_W, resolution=48).difference(hole)
+    logo = trace_logo()
+    art = unary_union([rim, hole_rim, printable(logo)]).intersection(base)
+    return base, art, dict(outline=outline, hole=hole, logo=logo, rims=unary_union([rim, hole_rim]))
 
 
 # -------------------------------------------------------------------- export
 def to_cross_section(geom):
-    polys = getattr(geom, "geoms", [geom])
     rings = []
-    for p in polys:
+    for p in getattr(geom, "geoms", [geom]):
         if p.is_empty:
             continue
         rings.append(list(p.exterior.coords)[:-1])
@@ -160,7 +115,7 @@ def write_stl(manifold, path):
     mesh = manifold.to_mesh()
     v, tris = mesh.vert_properties, mesh.tri_verts
     with open(path, "wb") as f:
-        f.write(b"Apex Smart Automations keychain".ljust(80, b" "))
+        f.write(b"Apex Smart Automation keychain".ljust(80, b" "))
         f.write(struct.pack("<I", len(tris)))
         for a, b, c in tris:
             p0, p1, p2 = (v[i][:3] for i in (a, b, c))
@@ -172,52 +127,58 @@ def write_stl(manifold, path):
     return len(tris)
 
 
-def svg_path(geom, h):
+def svg_path(geom, ox, oy):
     d = []
     for p in getattr(geom, "geoms", [geom]):
         if p.is_empty:
             continue
         for ring in [p.exterior, *p.interiors]:
-            pts = list(ring.coords)
-            d.append("M" + "L".join(f"{x:.3f},{h - y:.3f}" for x, y in pts) + "Z")
+            d.append("M" + "L".join(f"{x - ox:.3f},{oy - y:.3f}" for x, y in ring.coords) + "Z")
     return "".join(d)
 
 
-def write_svgs(base, art, parts):
-    W, H = TAG_W, TAG_H
-    color = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}">
-  <title>Apex Smart Automations keychain</title>
-  <defs>
-    <linearGradient id="gold" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="{GOLD_A}"/><stop offset="1" stop-color="{GOLD_B}"/>
-    </linearGradient>
-  </defs>
-  <path d="{svg_path(base, H)}" fill="{NAVY}" fill-rule="evenodd"/>
-  <path d="{svg_path(art, H)}" fill="url(#gold)" fill-rule="evenodd"/>
+def write_svgs(base, parts):
+    minx, miny, maxx, maxy = parts["outline"].bounds
+    W, H = maxx - minx, maxy - miny
+    ox, oy = minx, maxy  # svg origin top-left, y down
+    head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{W:.2f}mm" height="{H:.2f}mm" '
+            f'viewBox="0 0 {W:.3f} {H:.3f}">')
+
+    # full colour: the real logo image, clipped to the fob, with a blue rim
+    png = base64.b64encode(LOGO.read_bytes()).decode()
+    k = LOGO_FILL / LOGO_ART_R
+    cx, cy = -ox, oy  # fob centre in svg coords
+    color = f"""{head}
+  <title>Apex Smart Automation keychain</title>
+  <defs><clipPath id="disc"><circle cx="{cx:.3f}" cy="{cy:.3f}" r="{LOGO_BADGE_R * k:.3f}"/></clipPath></defs>
+  <path d="{svg_path(base, ox, oy)}" fill="{BLACK}" fill-rule="evenodd"/>
+  <image href="data:image/png;base64,{png}" x="{cx - LOGO_C * k:.3f}" y="{cy - LOGO_C * k:.3f}" width="{500 * k:.3f}" height="{500 * k:.3f}" clip-path="url(#disc)"/>
+  <path d="{svg_path(parts['rims'], ox, oy)}" fill="{BLUE}" fill-rule="evenodd"/>
 </svg>
 """
     (OUT / "apex-keychain.svg").write_text(color)
 
-    engrave = unary_union([parts["mark"], parts["word"], parts["sub"], parts["divider"]])
-    laser = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{W}mm" height="{H}mm" viewBox="0 0 {W} {H}">
+    laser = f"""{head}
   <title>Apex keychain laser file: red = cut, black = engrave</title>
-  <path d="{svg_path(engrave, H)}" fill="#000" fill-rule="evenodd"/>
-  <path d="{svg_path(parts['outline'], H)}{svg_path(parts['hole'], H)}" fill="none" stroke="#ff0000" stroke-width="0.01"/>
+  <path d="{svg_path(parts['logo'], ox, oy)}" fill="#000" fill-rule="evenodd"/>
+  <path d="{svg_path(parts['outline'], ox, oy)}{svg_path(parts['hole'], ox, oy)}" fill="none" stroke="#ff0000" stroke-width="0.01"/>
 </svg>
 """
     (OUT / "apex-keychain-laser.svg").write_text(laser)
+    return W, H
 
 
 def main():
     base, art, parts = build()
     base3d = to_cross_section(base).extrude(BASE_T)
     art3d = to_cross_section(art).extrude(RAISE_T).translate((0, 0, BASE_T))
-    n1 = write_stl(base3d + art3d, OUT / "apex-keychain.stl")
+    whole = base3d + art3d
+    n1 = write_stl(whole, OUT / "apex-keychain.stl")
     n2 = write_stl(base3d, OUT / "apex-keychain-base.stl")
     n3 = write_stl(art3d, OUT / "apex-keychain-inlay.stl")
-    write_svgs(base, art, parts)
-    print(f"tag {TAG_W}x{TAG_H}x{BASE_T + RAISE_T} mm | triangles: {n1} / {n2} / {n3}")
-    print("watertight:", (base3d + art3d).status())
+    W, H = write_svgs(base, parts)
+    print(f"fob {W:.1f} x {H:.1f} x {BASE_T + RAISE_T} mm | triangles: {n1} / {n2} / {n3}")
+    print("mesh status:", whole.status())
 
 
 if __name__ == "__main__":
